@@ -1,7 +1,10 @@
 use mockall::predicate::*;
 use mockall::*;
 
-use graph::{components::store::DeploymentLocator, prelude::*};
+use graph::{
+    components::store::{DeploymentId, DeploymentLocator},
+    prelude::*,
+};
 use web3::types::H256;
 
 mock! {
@@ -27,7 +30,7 @@ mock! {
 
         fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error>;
 
-        fn blocks(&self, hashes: Vec<H256>) -> Result<Vec<LightEthereumBlock>, Error>;
+        fn blocks(&self, hashes: &[H256]) -> Result<Vec<LightEthereumBlock>, Error>;
 
         fn ancestor_block(
             &self,
@@ -50,7 +53,7 @@ mock! {
 
 #[async_trait]
 impl SubgraphStore for MockStore {
-    fn find_ens_name(&self, _hash: &str) -> Result<Option<String>, QueryExecutionError> {
+    fn find_ens_name(&self, _hash: &str) -> Result<Option<String>, StoreError> {
         unimplemented!()
     }
 
@@ -98,23 +101,25 @@ impl SubgraphStore for MockStore {
         unimplemented!()
     }
 
-    fn writable(
-        &self,
-        _: &DeploymentLocator,
+    async fn writable(
+        self: Arc<Self>,
+        _: Logger,
+        _: DeploymentId,
     ) -> Result<Arc<dyn graph::components::store::WritableStore>, StoreError> {
         todo!()
     }
 
-    fn is_deployed(&self, _: &DeploymentHash) -> Result<bool, Error> {
+    fn is_deployed(&self, _: &DeploymentHash) -> Result<bool, StoreError> {
         todo!()
     }
 
-    fn least_block_ptr(&self, _: &DeploymentHash) -> Result<Option<BlockPtr>, Error> {
+    fn least_block_ptr(&self, _: &DeploymentHash) -> Result<Option<BlockPtr>, StoreError> {
         unimplemented!()
     }
 
     fn writable_for_network_indexer(
         &self,
+        _: Logger,
         _: &DeploymentHash,
     ) -> Result<Arc<dyn graph::components::store::WritableStore>, StoreError> {
         unimplemented!()

@@ -909,12 +909,12 @@ impl Display for DeploymentLocator {
 pub trait SubgraphStore: Send + Sync + 'static {
     /// Find the reverse of keccak256 for `hash` through looking it up in the
     /// rainbow table.
-    fn find_ens_name(&self, _hash: &str) -> Result<Option<String>, QueryExecutionError>;
+    fn find_ens_name(&self, _hash: &str) -> Result<Option<String>, StoreError>;
 
     /// Check if the store is accepting queries for the specified subgraph.
     /// May return true even if the specified subgraph is not currently assigned to an indexing
     /// node, as the store will still accept queries.
-    fn is_deployed(&self, id: &DeploymentHash) -> Result<bool, Error>;
+    fn is_deployed(&self, id: &DeploymentHash) -> Result<bool, StoreError>;
 
     /// Create a new deployment for the subgraph `name`. If the deployment
     /// already exists (as identified by the `schema.id`), reuse that, otherwise
@@ -964,10 +964,13 @@ pub trait SubgraphStore: Send + Sync + 'static {
     fn api_schema(&self, subgraph_id: &DeploymentHash) -> Result<Arc<ApiSchema>, StoreError>;
 
     /// Return a `WritableStore` that is used for indexing subgraphs. Only
-    /// code that is part of indexing a subgraph should ever use this.
-    fn writable(
-        &self,
-        deployment: &DeploymentLocator,
+    /// code that is part of indexing a subgraph should ever use this. The
+    /// `logger` will be used to log important messages related to the
+    /// subgraph
+    async fn writable(
+        self: Arc<Self>,
+        logger: Logger,
+        deployment: DeploymentId,
     ) -> Result<Arc<dyn WritableStore>, StoreError>;
 
     /// The network indexer does not follow the normal flow of how subgraphs
@@ -976,6 +979,7 @@ pub trait SubgraphStore: Send + Sync + 'static {
     /// `writable` should be used instead
     fn writable_for_network_indexer(
         &self,
+        logger: Logger,
         id: &DeploymentHash,
     ) -> Result<Arc<dyn WritableStore>, StoreError>;
 
@@ -983,16 +987,24 @@ pub trait SubgraphStore: Send + Sync + 'static {
     /// that we would use to query or copy from; in particular, this will
     /// ignore any instances of this deployment that are in the process of
     /// being set up
-    fn least_block_ptr(&self, id: &DeploymentHash) -> Result<Option<BlockPtr>, Error>;
+    fn least_block_ptr(&self, id: &DeploymentHash) -> Result<Option<BlockPtr>, StoreError>;
 
     /// Find the deployment locators for the subgraph with the given hash
     fn locators(&self, hash: &str) -> Result<Vec<DeploymentLocator>, StoreError>;
 }
 
+/// A view of the store for indexing. All indexing-related operations need
+/// to go through this trait. Methods in this trait will never return a
+/// `StoreError::DatabaseUnavailable`. Instead, they will retry the
+/// operation indefinitely until it succeeds.
 #[async_trait]
 pub trait WritableStore: Send + Sync + 'static {
     /// Get a pointer to the most recently processed block in the subgraph.
-    fn block_ptr(&self) -> Result<Option<BlockPtr>, Error>;
+    fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError>;
+
+    /// Returns the Firehose `cursor` this deployment is currently at in the block stream of events. This
+    /// is used when re-connecting a Firehose stream to start back exactly where we left off.
+    fn block_cursor(&self) -> Result<Option<String>, StoreError>;
 
     /// Start an existing subgraph deployment.
     fn start_subgraph_deployment(&self, logger: &Logger) -> Result<(), StoreError>;
@@ -1009,18 +1021,19 @@ pub trait WritableStore: Send + Sync + 'static {
     /// Set subgraph status to failed with the given error as the cause.
     async fn fail_subgraph(&self, error: SubgraphError) -> Result<(), StoreError>;
 
-    fn supports_proof_of_indexing<'a>(self: Arc<Self>) -> DynTryFuture<'a, bool>;
+    async fn supports_proof_of_indexing(&self) -> Result<bool, StoreError>;
 
     /// Looks up an entity using the given store key at the latest block.
-    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, QueryExecutionError>;
+    fn get(&self, key: &EntityKey) -> Result<Option<Entity>, StoreError>;
 
     /// Transact the entity changes from a single block atomically into the store, and update the
-    /// subgraph block pointer to `block_ptr_to`.
+    /// subgraph block pointer to `block_ptr_to`, and update the firehose cursor to `firehose_cursor`
     ///
     /// `block_ptr_to` must point to a child block of the current subgraph block pointer.
     fn transact_block_operations(
         &self,
         block_ptr_to: BlockPtr,
+        firehose_cursor: Option<String>,
         mods: Vec<EntityModification>,
         stopwatch: StopwatchMetrics,
         data_sources: Vec<StoredDynamicDataSource>,
@@ -1037,11 +1050,11 @@ pub trait WritableStore: Send + Sync + 'static {
     /// The deployment `id` finished syncing, mark it as synced in the database
     /// and promote it to the current version in the subgraphs where it was the
     /// pending version so far
-    fn deployment_synced(&self) -> Result<(), Error>;
+    fn deployment_synced(&self) -> Result<(), StoreError>;
 
     /// Return true if the deployment with the given id is fully synced,
     /// and return false otherwise. Errors from the store are passed back up
-    async fn is_deployment_synced(&self) -> Result<bool, Error>;
+    async fn is_deployment_synced(&self) -> Result<bool, StoreError>;
 
     fn unassign_subgraph(&self) -> Result<(), StoreError>;
 
@@ -1087,7 +1100,7 @@ pub type PoolWaitStats = Arc<RwLock<MovingStats>>;
 // The store trait must be implemented manually because mockall does not support async_trait, nor borrowing from arguments.
 #[async_trait]
 impl SubgraphStore for MockStore {
-    fn find_ens_name(&self, _hash: &str) -> Result<Option<String>, QueryExecutionError> {
+    fn find_ens_name(&self, _hash: &str) -> Result<Option<String>, StoreError> {
         unimplemented!()
     }
 
@@ -1135,20 +1148,25 @@ impl SubgraphStore for MockStore {
         unimplemented!()
     }
 
-    fn writable(&self, _: &DeploymentLocator) -> Result<Arc<dyn WritableStore>, StoreError> {
+    async fn writable(
+        self: Arc<Self>,
+        _: Logger,
+        _: DeploymentId,
+    ) -> Result<Arc<dyn WritableStore>, StoreError> {
         Ok(Arc::new(MockStore::new()))
     }
 
-    fn is_deployed(&self, _: &DeploymentHash) -> Result<bool, Error> {
+    fn is_deployed(&self, _: &DeploymentHash) -> Result<bool, StoreError> {
         unimplemented!()
     }
 
-    fn least_block_ptr(&self, _: &DeploymentHash) -> Result<Option<BlockPtr>, Error> {
+    fn least_block_ptr(&self, _: &DeploymentHash) -> Result<Option<BlockPtr>, StoreError> {
         unimplemented!()
     }
 
     fn writable_for_network_indexer(
         &self,
+        _: Logger,
         _: &DeploymentHash,
     ) -> Result<Arc<dyn WritableStore>, StoreError> {
         unimplemented!()
@@ -1162,7 +1180,11 @@ impl SubgraphStore for MockStore {
 // The store trait must be implemented manually because mockall does not support async_trait, nor borrowing from arguments.
 #[async_trait]
 impl WritableStore for MockStore {
-    fn block_ptr(&self) -> Result<Option<BlockPtr>, Error> {
+    fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError> {
+        unimplemented!()
+    }
+
+    fn block_cursor(&self) -> Result<Option<String>, StoreError> {
         unimplemented!()
     }
 
@@ -1182,17 +1204,18 @@ impl WritableStore for MockStore {
         unimplemented!()
     }
 
-    fn supports_proof_of_indexing<'a>(self: Arc<Self>) -> DynTryFuture<'a, bool> {
+    async fn supports_proof_of_indexing(&self) -> Result<bool, StoreError> {
         unimplemented!()
     }
 
-    fn get(&self, _: &EntityKey) -> Result<Option<Entity>, QueryExecutionError> {
+    fn get(&self, _: &EntityKey) -> Result<Option<Entity>, StoreError> {
         unimplemented!()
     }
 
     fn transact_block_operations(
         &self,
         _: BlockPtr,
+        _: Option<String>,
         _: Vec<EntityModification>,
         _: StopwatchMetrics,
         _: Vec<StoredDynamicDataSource>,
@@ -1208,7 +1231,7 @@ impl WritableStore for MockStore {
         self.get_many_mock(ids_for_type)
     }
 
-    async fn is_deployment_synced(&self) -> Result<bool, Error> {
+    async fn is_deployment_synced(&self) -> Result<bool, StoreError> {
         unimplemented!()
     }
 
@@ -1220,7 +1243,7 @@ impl WritableStore for MockStore {
         unimplemented!()
     }
 
-    fn deployment_synced(&self) -> Result<(), Error> {
+    fn deployment_synced(&self) -> Result<(), StoreError> {
         unimplemented!()
     }
 
@@ -1276,7 +1299,7 @@ pub trait ChainStore: Send + Sync + 'static {
     fn chain_head_ptr(&self) -> Result<Option<BlockPtr>, Error>;
 
     /// Returns the blocks present in the store.
-    fn blocks(&self, hashes: Vec<H256>) -> Result<Vec<LightEthereumBlock>, Error>;
+    fn blocks(&self, hashes: &[H256]) -> Result<Vec<LightEthereumBlock>, Error>;
 
     /// Get the `offset`th ancestor of `block_hash`, where offset=0 means the block matching
     /// `block_hash` and offset=1 means its parent. Returns None if unable to complete due to
@@ -1345,7 +1368,7 @@ pub trait QueryStore: Send + Sync {
 
     async fn is_deployment_synced(&self) -> Result<bool, Error>;
 
-    fn block_ptr(&self) -> Result<Option<BlockPtr>, Error>;
+    fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError>;
 
     fn block_number(&self, block_hash: H256) -> Result<Option<BlockNumber>, StoreError>;
 
@@ -1387,17 +1410,24 @@ pub trait StatusStore: Send + Sync + 'static {
         subgraph_id: &str,
     ) -> Result<(Option<String>, Option<String>), StoreError>;
 
+    /// Support for the explorer-specific API. Returns a vector of (name, version) of all
+    /// subgraphs for a given deployment hash.
+    fn subgraphs_for_deployment_hash(
+        &self,
+        deployment_hash: &str,
+    ) -> Result<Vec<(String, String)>, StoreError>;
+
     /// A value of None indicates that the table is not available. Re-deploying
     /// the subgraph fixes this. It is undesirable to force everything to
     /// re-sync from scratch, so existing deployments will continue without a
     /// Proof of Indexing. Once all subgraphs have been re-deployed the Option
     /// can be removed.
-    fn get_proof_of_indexing<'a>(
-        self: Arc<Self>,
-        subgraph_id: &'a DeploymentHash,
-        indexer: &'a Option<Address>,
+    async fn get_proof_of_indexing(
+        &self,
+        subgraph_id: &DeploymentHash,
+        indexer: &Option<Address>,
         block: BlockPtr,
-    ) -> DynTryFuture<'a, Option<[u8; 32]>>;
+    ) -> Result<Option<[u8; 32]>, StoreError>;
 }
 
 /// An entity operation that can be transacted into the store; as opposed to

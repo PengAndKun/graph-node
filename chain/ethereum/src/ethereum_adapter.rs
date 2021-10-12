@@ -1243,7 +1243,7 @@ impl EthereumAdapterTrait for EthereumAdapter {
                     .timeout_secs(60)
                     .run(move || {
                         web3.eth()
-                            .uncle(block_hash.clone().into(), index.into())
+                            .uncle(block_hash.into(), index.into())
                             .map_err(move |e| {
                                 anyhow!(
                                     "could not get uncle {} for block {:?} ({} uncles): {}",
@@ -1361,9 +1361,10 @@ impl EthereumAdapterTrait for EthereumAdapter {
         chain_store: Arc<dyn ChainStore>,
         block_hashes: HashSet<H256>,
     ) -> Box<dyn Stream<Item = LightEthereumBlock, Error = Error> + Send> {
+        let block_hashes: Vec<_> = block_hashes.iter().cloned().collect();
         // Search for the block in the store first then use json-rpc as a backup.
         let mut blocks = chain_store
-            .blocks(block_hashes.iter().cloned().collect())
+            .blocks(&block_hashes)
             .map_err(|e| error!(&logger, "Error accessing block cache {}", e))
             .unwrap_or_default();
 
@@ -1760,7 +1761,7 @@ async fn filter_call_triggers_from_unsuccessful_transactions(
         .transaction_receipts_in_block(&block.ptr().hash_as_h256())
         .await?
         .into_iter()
-        .map(|receipt| (receipt.transaction_hash.clone(), receipt))
+        .map(|receipt| (receipt.transaction_hash, receipt))
         .collect::<BTreeMap<H256, LightTransactionReceipt>>();
 
     // Do we have a receipt for each transaction under analysis?

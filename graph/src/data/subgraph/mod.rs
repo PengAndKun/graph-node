@@ -206,7 +206,7 @@ impl SubgraphName {
         }
 
         // Parse into components and validate each
-        for part in s.split("/") {
+        for part in s.split('/') {
             // Each part must be non-empty and not too long
             if part.is_empty() || part.len() > 32 {
                 return Err(());
@@ -607,9 +607,13 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
         ))
     }
 
+    /// Validates the subgraph manifest file.
+    ///
+    /// Graft base validation will be skipped if the parameter `validate_graft_base` is false.
     pub fn validate<S: SubgraphStore>(
         self,
         store: Arc<S>,
+        validate_graft_base: bool,
     ) -> Result<SubgraphManifest<C>, Vec<SubgraphManifestValidationError>> {
         let (schemas, _) = self.0.schema.resolve_schema_references(store.clone());
 
@@ -633,7 +637,8 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
             .0
             .data_sources
             .iter()
-            .filter(|d| d.kind().eq("ethereum/contract"))
+            // FIXME (NEAR): Once more refactoring is merged in, this should go away as validation has been pushed to a chain specific check now
+            .filter(|d| d.kind().eq("ethereum/contract") || d.kind().eq("near/blocks"))
             .filter_map(|d| d.network().map(|n| n.to_string()))
             .collect::<Vec<String>>();
         networks.sort();
@@ -661,7 +666,9 @@ impl<C: Blockchain> UnvalidatedSubgraphManifest<C> {
                     "Grafting of subgraphs is currently disabled".to_owned(),
                 ));
             }
-            errors.extend(graft.validate(store));
+            if validate_graft_base {
+                errors.extend(graft.validate(store));
+            }
         }
 
         // Validate subgraph feature usage and declaration.
@@ -712,7 +719,8 @@ impl<C: Blockchain> SubgraphManifest<C> {
         // Assume the manifest has been validated, ensuring network names are homogenous
         self.data_sources
             .iter()
-            .filter(|d| d.kind() == "ethereum/contract")
+            // FIXME (NEAR): Once more refactoring is merged in, this should go away as validation has been pushed to a chain specific check now
+            .filter(|d| d.kind() == "ethereum/contract" || d.kind() == "near/blocks")
             .filter_map(|d| d.network().map(|n| n.to_string()))
             .next()
             .expect("Validated manifest does not have a network defined on any datasource")

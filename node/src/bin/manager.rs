@@ -382,6 +382,7 @@ impl Context {
         Arc::new(SubscriptionManager::new(
             self.logger.clone(),
             primary.connection.to_owned(),
+            self.registry.clone(),
         ))
     }
 
@@ -432,13 +433,14 @@ impl Context {
         let store = self.store();
 
         let subscription_manager = Arc::new(PanicSubscriptionManager);
-        let load_manager = Arc::new(LoadManager::new(&logger, vec![], registry));
+        let load_manager = Arc::new(LoadManager::new(&logger, vec![], registry.clone()));
 
         Arc::new(GraphQlRunner::new(
             &logger,
             store,
             subscription_manager,
             load_manager,
+            registry,
         ))
     }
 }
@@ -484,7 +486,7 @@ async fn main() {
         }
         Ok(node) => node,
     };
-    let ctx = Context::new(logger, node, config);
+    let ctx = Context::new(logger.clone(), node, config);
 
     use Command::*;
     let result = match opt.cmd {
@@ -531,7 +533,9 @@ async fn main() {
         }
         Remove { name } => commands::remove::run(ctx.subgraph_store(), name),
         Create { name } => commands::create::run(ctx.subgraph_store(), name),
-        Unassign { id, shard } => commands::assign::unassign(ctx.subgraph_store(), id, shard),
+        Unassign { id, shard } => {
+            commands::assign::unassign(logger.clone(), ctx.subgraph_store(), id, shard).await
+        }
         Reassign { id, node, shard } => {
             commands::assign::reassign(ctx.subgraph_store(), id, node, shard)
         }

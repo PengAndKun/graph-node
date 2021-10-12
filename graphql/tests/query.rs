@@ -30,8 +30,9 @@ use graph::{
 use graph_graphql::{prelude::*, subscription::execute_subscription};
 use test_store::{
     deployment_state, execute_subgraph_query_with_complexity, execute_subgraph_query_with_deadline,
-    revert_block, run_test_sequentially, transact_entity_operations, transact_errors, Store,
-    BLOCK_ONE, GENESIS_PTR, LOAD_MANAGER, LOGGER, STORE, SUBSCRIPTION_MANAGER,
+    result_size_metrics, revert_block, run_test_sequentially, transact_entity_operations,
+    transact_errors, Store, BLOCK_ONE, GENESIS_PTR, LOAD_MANAGER, LOGGER, METRICS_REGISTRY, STORE,
+    SUBSCRIPTION_MANAGER,
 };
 
 const NETWORK_NAME: &str = "fake_network";
@@ -258,6 +259,7 @@ async fn execute_query_document_with_variables(
         STORE.clone(),
         SUBSCRIPTION_MANAGER.clone(),
         LOAD_MANAGER.clone(),
+        METRICS_REGISTRY.clone(),
     ));
     let target = QueryTarget::Deployment(id.clone());
     let query = Query::new(query, variables);
@@ -270,16 +272,8 @@ async fn execute_query_document_with_variables(
         .duplicate()
 }
 
-async fn first_result<F>(f: F) -> QueryResult
-where
-    F: FnOnce() -> QueryResults + Sync + Send + 'static,
-{
-    graph::spawn_blocking_allow_panic(f)
-        .await
-        .unwrap()
-        .first()
-        .unwrap()
-        .duplicate()
+async fn first_result(f: QueryResults) -> QueryResult {
+    f.first().unwrap().duplicate()
 }
 
 /// Extract the data from a `QueryResult`, and panic if it has errors
@@ -804,9 +798,9 @@ fn query_complexity() {
 
         // This query is exactly at the maximum complexity.
         let hash2 = deployment.hash.clone();
-        let result = first_result(move || {
-            execute_subgraph_query_with_complexity(query, hash2.into(), max_complexity)
-        })
+        let result = first_result(
+            execute_subgraph_query_with_complexity(query, hash2.into(), max_complexity).await,
+        )
         .await;
         assert!(!result.has_errors());
 
@@ -835,9 +829,10 @@ fn query_complexity() {
         );
 
         // The extra introspection causes the complexity to go over.
-        let result = first_result(move || {
+        let result = first_result(
             execute_subgraph_query_with_complexity(query, deployment.hash.into(), max_complexity)
-        })
+                .await,
+        )
         .await;
         match result.to_result().unwrap_err()[0] {
             QueryError::ExecutionError(QueryExecutionError::TooComplex(1_010_200, _)) => (),
@@ -885,6 +880,7 @@ fn query_complexity_subscriptions() {
             max_depth: 100,
             max_first: std::u32::MAX,
             max_skip: std::u32::MAX,
+            result_size: result_size_metrics(),
         };
         let schema = STORE.subgraph_store().api_schema(&deployment.hash).unwrap();
 
@@ -933,6 +929,7 @@ fn query_complexity_subscriptions() {
             max_depth: 100,
             max_first: std::u32::MAX,
             max_skip: std::u32::MAX,
+            result_size: result_size_metrics(),
         };
 
         // The extra introspection causes the complexity to go over.
@@ -958,13 +955,14 @@ fn instant_timeout() {
             None,
         );
 
-        match first_result(move || {
+        match first_result(
             execute_subgraph_query_with_deadline(
                 query,
                 deployment.hash.into(),
                 Some(Instant::now()),
             )
-        })
+            .await,
+        )
         .await
         .to_result()
         .unwrap_err()[0]
@@ -1311,6 +1309,7 @@ fn subscription_gets_result_even_without_events() {
             max_depth: 100,
             max_first: std::u32::MAX,
             max_skip: std::u32::MAX,
+            result_size: result_size_metrics(),
         };
         // Execute the subscription and expect at least one result to be
         // available in the result stream
@@ -1613,7 +1612,7 @@ fn query_detects_reorg() {
         );
 
         // Revert one block
-        revert_block(&*STORE, &deployment, &*GENESIS_PTR);
+        revert_block(&*STORE, &deployment, &*GENESIS_PTR).await;
         // A query is still fine since we implicitly query at block 0; we were
         // at block 1 when we got `state`, and reorged once by one block, which
         // can not affect block 0, and it's therefore ok to query at block 0
@@ -1740,7 +1739,9 @@ fn non_fatal_errors() {
             deterministic: true,
         };
 
-        transact_errors(&*STORE, &deployment, BLOCK_TWO.block_ptr(), vec![err]).unwrap();
+        transact_errors(&*STORE, &deployment, BLOCK_TWO.block_ptr(), vec![err])
+            .await
+            .unwrap();
 
         // `subgraphError` is implicitly `deny`, data is omitted.
         let query = "query { musician(id: \"m1\") { id } }";
@@ -1798,7 +1799,7 @@ fn non_fatal_errors() {
         assert_eq!(expected, serde_json::to_value(&result).unwrap());
 
         // Test error reverts.
-        revert_block(&*STORE, &deployment, &*BLOCK_ONE);
+        revert_block(&*STORE, &deployment, &*BLOCK_ONE).await;
         let query = "query { musician(id: \"m1\") { id }  _meta { hasIndexingErrors } }";
         let query = graphql_parser::parse_query(query).unwrap().into_static();
         let result = execute_query_document(&deployment.hash, query).await;

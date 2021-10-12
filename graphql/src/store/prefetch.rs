@@ -2,6 +2,9 @@
 //! final result
 
 use anyhow::{anyhow, Error};
+use graph::prelude::CacheWeight;
+use graph::slog::warn;
+use graph::util::cache_weight::btree_node_size;
 use indexmap::IndexMap;
 use lazy_static::lazy_static;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -21,6 +24,7 @@ use graph::{
 
 use crate::execution::{ExecutionContext, Resolver};
 use crate::query::ast as qast;
+use crate::runner::ResultSizeMetrics;
 use crate::schema::ast as sast;
 use crate::store::{build_query, StoreResolver};
 
@@ -33,6 +37,14 @@ lazy_static! {
     /// by Specific Attributes".
     static ref DISABLE_EXPERIMENTAL_FEATURE_SELECT_BY_SPECIFIC_ATTRIBUTE_NAMES: bool =
         !std::env::var("GRAPH_ENABLE_SELECT_BY_SPECIFIC_ATTRIBUTES").is_ok();
+
+    static ref RESULT_SIZE_WARN: usize = std::env::var("GRAPH_GRAPHQL_WARN_RESULT_SIZE")
+        .map(|s| s.parse::<usize>().expect("`GRAPH_GRAPHQL_WARN_RESULT_SIZE` is a number"))
+        .unwrap_or(std::usize::MAX);
+
+    static ref RESULT_SIZE_ERROR: usize = std::env::var("GRAPH_GRAPHQL_ERROR_RESULT_SIZE")
+        .map(|s| s.parse::<usize>().expect("`GRAPH_GRAPHQL_ERROR_RESULT_SIZE` is a number"))
+        .unwrap_or(std::usize::MAX);
 }
 
 type GroupedFieldSet<'a> = IndexMap<&'a str, CollectedResponseKey<'a>>;
@@ -78,22 +90,68 @@ impl<'a> From<&'a s::ObjectType> for ObjectCondition<'a> {
 /// has an entry mapping the response key to the list of nodes.
 #[derive(Debug, Clone)]
 struct Node {
+    /// Estimate the size of the children using their `CacheWeight`. This
+    /// field will have the cache weight of the `entity` plus the weight of
+    /// the keys and values of the `children` map, but not of the map itself
+    children_weight: usize,
+
     entity: BTreeMap<String, q::Value>,
     /// We are using an `Rc` here for two reasons: it allows us to defer
     /// copying objects until the end, when converting to `q::Value` forces
     /// us to copy any child that is referenced by multiple parents. It also
     /// makes it possible to avoid unnecessary copying of a child that is
-    /// referenced by only one parent - without the `Rc` we would have to copy
-    /// since we do not know that only one parent uses it.
+    /// referenced by only one parent - without the `Rc` we would have to
+    /// copy since we do not know that only one parent uses it.
+    ///
+    /// Multiple parents can reference a single child in the following
+    /// situation: assume a GraphQL query `balances { token { issuer {id}}}`
+    /// where `balances` stores the `id` of the `token`, and `token` stores
+    /// the `id` of its `issuer`. Execution of the query when all `balances`
+    /// reference the same `token` will happen through several invocations
+    /// of `fetch`. For the purposes of this comment, we can think of
+    /// `fetch` as taking a list of `(parent_id, child_id)` pairs and
+    /// returning entities that are identified by this pair, i.e., there
+    /// will be one entity for each unique `(parent_id, child_id)`
+    /// combination, rather than one for each unique `child_id`. In reality,
+    /// of course, we will usually not know the `child_id` yet until we
+    /// actually run the query.
+    ///
+    /// Query execution works as follows:
+    /// 1. Fetch all `balances`, returning `#b` `Balance` entities. The
+    ///    `Balance.token` field will be the same for all these entities.
+    /// 2. Fetch `#b` `Token` entities, identified through `(Balance.id,
+    ///    Balance.token)` resulting in one `Token` entity
+    /// 3. Fetch 1 `Issuer` entity, identified through `(Token.id,
+    ///    Token.issuer)`
+    /// 4. Glue all these results together into a DAG through invocations of
+    ///    `Join::perform`
+    ///
+    /// We now have `#b` `Node` instances representing the same `Token`, but
+    /// each the child of a different `Node` for the `#b` balances. Each of
+    /// those `#b` `Token` nodes points to the same `Issuer` node. It's
+    /// important to note that the issuer node could itself be the root of a
+    /// large tree and could therefore take up a lot of memory. When we
+    /// convert this DAG into `q::Value`, we need to make `#b` copies of the
+    /// `Issuer` node. Using an `Rc` in `Node` allows us to defer these
+    /// copies to the point where we need to convert to `q::Value`, and it
+    /// would be desirable to base the data structure that GraphQL execution
+    /// uses on a DAG rather than a tree, but that's a good amount of work
     children: BTreeMap<String, Vec<Rc<Node>>>,
 }
 
 impl From<BTreeMap<String, q::Value>> for Node {
     fn from(entity: BTreeMap<String, q::Value>) -> Self {
         Node {
+            children_weight: entity.weight(),
             entity,
             children: BTreeMap::default(),
         }
+    }
+}
+
+impl CacheWeight for Node {
+    fn indirect_weight(&self) -> usize {
+        self.children_weight + btree_node_size(&self.children)
     }
 }
 
@@ -127,8 +185,10 @@ fn is_root_node<'a>(mut nodes: impl Iterator<Item = &'a Node>) -> bool {
 }
 
 fn make_root_node() -> Vec<Node> {
+    let entity = BTreeMap::new();
     vec![Node {
-        entity: BTreeMap::new(),
+        children_weight: entity.weight(),
+        entity,
         children: BTreeMap::default(),
     }]
 }
@@ -178,6 +238,22 @@ impl Node {
             .expect("all entities have a __typename")
             .as_str()
             .expect("__typename must be a string")
+    }
+
+    fn set_children(&mut self, response_key: String, nodes: Vec<Rc<Node>>) {
+        fn nodes_weight(nodes: &Vec<Rc<Node>>) -> usize {
+            let vec_weight = nodes.capacity() * std::mem::size_of::<Rc<Node>>();
+            let children_weight = nodes.iter().map(|node| node.weight()).sum::<usize>();
+            vec_weight + children_weight
+        }
+
+        let key_weight = response_key.weight();
+
+        self.children_weight += nodes_weight(&nodes) + key_weight;
+        let old = self.children.insert(response_key, nodes);
+        if let Some(old) = old {
+            self.children_weight -= nodes_weight(&old) + key_weight;
+        }
     }
 }
 
@@ -360,12 +436,12 @@ impl<'a> Join<'a> {
     /// The `children` must contain the nodes in the correct order for each
     /// parent; we simply pick out matching children for each parent but
     /// otherwise maintain the order in `children`
-    fn perform(mut parents: Vec<&mut Node>, children: Vec<Node>, response_key: &str) {
+    fn perform(parents: &mut [&mut Node], children: Vec<Node>, response_key: &str) {
         let children: Vec<_> = children.into_iter().map(Rc::new).collect();
 
         if parents.len() == 1 {
             let parent = parents.first_mut().expect("we just checked");
-            parent.children.insert(response_key.to_owned(), children);
+            parent.set_children(response_key.to_owned(), children);
             return;
         }
 
@@ -394,9 +470,7 @@ impl<'a> Join<'a> {
             // query are always joined first, and may then be overwritten by the merged selection
             // set under the object type condition. See also: e0d6da3e-60cf-41a5-b83c-b60a7a766d4a
             let values = parent.id().ok().and_then(|id| grouped.get(&*id).cloned());
-            parent
-                .children
-                .insert(response_key.to_owned(), values.unwrap_or(vec![]));
+            parent.set_children(response_key.to_owned(), values.unwrap_or(vec![]));
         }
     }
 
@@ -458,8 +532,10 @@ pub fn run(
     resolver: &StoreResolver,
     ctx: &ExecutionContext<impl Resolver>,
     selection_set: &q::SelectionSet,
+    result_size: &ResultSizeMetrics,
 ) -> Result<q::Value, Vec<QueryExecutionError>> {
     execute_root_selection_set(resolver, ctx, selection_set).map(|nodes| {
+        result_size.observe(nodes.weight());
         let map = BTreeMap::default();
         q::Value::Object(nodes.into_iter().fold(map, |mut map, node| {
             // For root nodes, we only care about the children
@@ -485,6 +561,16 @@ fn execute_root_selection_set(
     execute_selection_set(resolver, ctx, make_root_node(), grouped_field_set)
 }
 
+fn check_result_size(logger: &Logger, size: usize) -> Result<(), QueryExecutionError> {
+    if size > *RESULT_SIZE_ERROR {
+        return Err(QueryExecutionError::ResultTooBig(size, *RESULT_SIZE_ERROR));
+    }
+    if size > *RESULT_SIZE_WARN {
+        warn!(logger, "Large query result"; "size" => size);
+    }
+    Ok(())
+}
+
 fn execute_selection_set<'a>(
     resolver: &StoreResolver,
     ctx: &'a ExecutionContext<impl Resolver>,
@@ -505,7 +591,7 @@ fn execute_selection_set<'a>(
 
         for (type_cond, fields) in collected_fields {
             // Filter out parents that do not match the type condition.
-            let parents: Vec<&mut Node> = if is_root_node(parents.iter()) {
+            let mut parents: Vec<&mut Node> = if is_root_node(parents.iter()) {
                 parents.iter_mut().collect()
             } else {
                 parents
@@ -560,7 +646,12 @@ fn execute_selection_set<'a>(
             ) {
                 Ok(children) => {
                     match execute_selection_set(resolver, ctx, children, grouped_field_set) {
-                        Ok(children) => Join::perform(parents, children, response_key),
+                        Ok(children) => {
+                            Join::perform(&mut parents, children, response_key);
+                            let weight =
+                                parents.iter().map(|parent| parent.weight()).sum::<usize>();
+                            check_result_size(&ctx.logger, weight)?;
+                        }
                         Err(mut e) => errors.append(&mut e),
                     }
                 }
@@ -625,7 +716,7 @@ impl<'a> CollectedResponseKey<'a> {
                     }
                 }
                 s::TypeDefinition::Scalar(_) | s::TypeDefinition::Enum(_) => {}
-                s::TypeDefinition::Union(_) | s::TypeDefinition::InputObject(_) => return,
+                s::TypeDefinition::Union(_) | s::TypeDefinition::InputObject(_) => {}
             });
 
         // collect the column name if field exists in schema

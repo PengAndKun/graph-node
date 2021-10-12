@@ -17,7 +17,7 @@ use graph::{
 };
 use graph::{
     blockchain::{block_stream::BlockStreamEvent, Blockchain, TriggerFilter as _},
-    components::subgraph::{MappingError, ProofOfIndexing, SharedProofOfIndexing},
+    components::subgraph::{CausalityRegion, MappingError, ProofOfIndexing, SharedProofOfIndexing},
 };
 use graph::{
     blockchain::{Block, BlockchainMap},
@@ -194,6 +194,12 @@ where
                         .start_subgraph_inner::<graph_chain_ethereum::Chain>(logger, loc, manifest)
                         .await
                 }
+
+                BlockchainKind::Near => {
+                    instance_manager
+                        .start_subgraph_inner::<graph_chain_near::Chain>(logger, loc, manifest)
+                        .await
+                }
             }
         };
         // Perform the actual work of starting the subgraph in a separate
@@ -261,7 +267,11 @@ where
     ) -> Result<(), Error> {
         let subgraph_store = self.subgraph_store.cheap_clone();
         let registry = self.metrics_registry.cheap_clone();
-        let store = self.subgraph_store.writable(&deployment)?;
+        let store = self
+            .subgraph_store
+            .cheap_clone()
+            .writable(logger.clone(), deployment.id)
+            .await?;
 
         // Start the subgraph deployment before reading dynamic data
         // sources; if the subgraph is a graft or a copy, starting it will
@@ -481,9 +491,9 @@ where
 
         // Process events from the stream as long as no restart is needed
         loop {
-            let block = match block_stream.next().await {
-                Some(Ok(BlockStreamEvent::ProcessBlock(block))) => block,
-                Some(Ok(BlockStreamEvent::Revert(subgraph_ptr))) => {
+            let (block, cursor) = match block_stream.next().await {
+                Some(Ok(BlockStreamEvent::ProcessBlock(block, cursor))) => (block, cursor),
+                Some(Ok(BlockStreamEvent::Revert(subgraph_ptr, _))) => {
                     info!(
                         logger,
                         "Reverting block to get back to main chain";
@@ -506,7 +516,7 @@ where
                                 .map_err(Into::into)
                         })
                     {
-                        debug!(
+                        error!(
                             &logger,
                             "Could not revert block. \
                             The likely cause is the block not being found due to a deep reorg. \
@@ -564,6 +574,7 @@ where
                 ctx,
                 block_stream_cancel_handle.clone(),
                 block,
+                cursor.into(),
             )
             .await;
 
@@ -656,6 +667,12 @@ impl From<Error> for BlockProcessingError {
     }
 }
 
+impl From<StoreError> for BlockProcessingError {
+    fn from(e: StoreError) -> Self {
+        BlockProcessingError::Unknown(e.into())
+    }
+}
+
 /// Processes a block and returns the updated context and a boolean flag indicating
 /// whether new dynamic data sources have been added to the subgraph.
 async fn process_block<T: RuntimeHostBuilder<C>, C: Blockchain>(
@@ -664,6 +681,7 @@ async fn process_block<T: RuntimeHostBuilder<C>, C: Blockchain>(
     mut ctx: IndexingContext<T, C>,
     block_stream_cancel_handle: CancelHandle,
     block: BlockWithTriggers<C>,
+    firehose_cursor: Option<String>,
 ) -> Result<(IndexingContext<T, C>, bool), BlockProcessingError> {
     let triggers = block.trigger_data;
     let block = Arc::new(block.block);
@@ -700,6 +718,9 @@ async fn process_block<T: RuntimeHostBuilder<C>, C: Blockchain>(
         None
     };
 
+    // There are currently no other causality regions since offchain data is not supported.
+    let causality_region = CausalityRegion::from_network(ctx.state.instance.network());
+
     // Process events one after the other, passing in entity operations
     // collected previously to every new event being processed
     let mut block_state = match process_triggers(
@@ -713,6 +734,7 @@ async fn process_block<T: RuntimeHostBuilder<C>, C: Blockchain>(
         &ctx.state.instance,
         &block,
         triggers,
+        &causality_region,
     )
     .await
     {
@@ -802,6 +824,7 @@ async fn process_block<T: RuntimeHostBuilder<C>, C: Blockchain>(
                 &trigger,
                 block_state,
                 proof_of_indexing.cheap_clone(),
+                &causality_region,
             )
             .await
             .map_err(|e| {
@@ -821,17 +844,10 @@ async fn process_block<T: RuntimeHostBuilder<C>, C: Blockchain>(
     // The triggers were processed but some were skipped due to deterministic errors, if the
     // `nonFatalErrors` feature is not present, return early with an error.
     let has_errors = block_state.has_errors();
-    if has_errors
-        && !ctx
-            .inputs
-            .features
-            .contains(&SubgraphFeature::NonFatalErrors)
-    {
-        // Take just the first error to report.
-        return Err(BlockProcessingError::Deterministic(
-            block_state.deterministic_errors.into_iter().next().unwrap(),
-        ));
-    }
+    let is_non_fatal_errors_active = ctx
+        .inputs
+        .features
+        .contains(&SubgraphFeature::NonFatalErrors);
 
     // Apply entity operations and advance the stream
 
@@ -853,7 +869,7 @@ async fn process_block<T: RuntimeHostBuilder<C>, C: Blockchain>(
 
     let section = ctx.host_metrics.stopwatch.start_section("as_modifications");
     let ModificationsAndCache {
-        modifications: mods,
+        modifications: mut mods,
         data_sources,
         entity_lfu_cache: mut cache,
     } = block_state
@@ -894,14 +910,43 @@ async fn process_block<T: RuntimeHostBuilder<C>, C: Blockchain>(
 
     let store = &ctx.inputs.store;
 
+    // If a deterministic error has happened, make the PoI to be the only entity that'll be stored.
+    if has_errors && !is_non_fatal_errors_active {
+        let is_poi_entity = |entity_mod: &EntityModification| {
+            entity_mod.entity_key().entity_type.as_str() == "Poi$"
+        };
+        mods.retain(is_poi_entity);
+        // Confidence check
+        assert!(
+            mods.len() == 1,
+            "There should be only one PoI EntityModification"
+        );
+    }
+
+    let BlockState {
+        deterministic_errors,
+        ..
+    } = block_state;
+
+    let first_error = deterministic_errors.first().cloned();
+
     match store.transact_block_operations(
         block_ptr,
+        firehose_cursor,
         mods,
         stopwatch,
         data_sources,
-        block_state.deterministic_errors,
+        deterministic_errors,
     ) {
         Ok(_) => {
+            // If a deterministic error has happened, make the subgraph fail.
+            // In this scenario the only entity that is stored/transacted is the PoI,
+            // all of the others are discarded.
+            if has_errors && !is_non_fatal_errors_active {
+                // Only the first error is reported.
+                return Err(BlockProcessingError::Deterministic(first_error.unwrap()));
+            }
+
             let elapsed = start.elapsed().as_secs_f64();
             metrics.block_ops_transaction_duration.observe(elapsed);
 
@@ -979,6 +1024,7 @@ async fn process_triggers<C: Blockchain>(
     instance: &SubgraphInstance<C, impl RuntimeHostBuilder<C>>,
     block: &Arc<C::Block>,
     triggers: Vec<C::TriggerData>,
+    causality_region: &str,
 ) -> Result<BlockState<C>, MappingError> {
     use graph::blockchain::TriggerData;
 
@@ -991,6 +1037,7 @@ async fn process_triggers<C: Blockchain>(
                 &trigger,
                 block_state,
                 proof_of_indexing.cheap_clone(),
+                causality_region,
             )
             .await
             .map_err(move |mut e| {

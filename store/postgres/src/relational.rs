@@ -13,6 +13,7 @@ use graph::prelude::{q, s, StopwatchMetrics};
 use graph::slog::warn;
 use inflector::Inflector;
 use lazy_static::lazy_static;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::convert::{From, TryFrom};
 use std::env;
@@ -71,7 +72,7 @@ lazy_static! {
             // qualified name
             env::var("GRAPH_ACCOUNT_TABLES")
                 .ok()
-                .map(|v| v.split(",").map(|s| format!("\"{}\"", s.replace(".", "\".\""))).collect())
+                .map(|v| v.split(',').map(|s| format!("\"{}\"", s.replace(".", "\".\""))).collect())
                 .unwrap_or(HashSet::new())
     };
 
@@ -533,7 +534,7 @@ impl Layout {
     pub fn find_many<'a>(
         &self,
         conn: &PgConnection,
-        ids_for_type: BTreeMap<&EntityType, Vec<&str>>,
+        ids_for_type: &BTreeMap<&EntityType, Vec<&str>>,
         block: BlockNumber,
     ) -> Result<BTreeMap<EntityType, Vec<Entity>>, StoreError> {
         if ids_for_type.is_empty() {
@@ -560,11 +561,11 @@ impl Layout {
         Ok(entities_for_type)
     }
 
-    pub fn insert(
-        &self,
+    pub fn insert<'a>(
+        &'a self,
         conn: &PgConnection,
-        entity_type: &EntityType,
-        entities: &mut [(EntityKey, Entity)],
+        entity_type: &'a EntityType,
+        entities: &'a mut [(&'a EntityKey, Cow<'a, Entity>)],
         block: BlockNumber,
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
@@ -675,11 +676,11 @@ impl Layout {
             .collect()
     }
 
-    pub fn update(
-        &self,
+    pub fn update<'a>(
+        &'a self,
         conn: &PgConnection,
-        entity_type: &EntityType,
-        entities: &mut [(EntityKey, Entity)],
+        entity_type: &'a EntityType,
+        entities: &'a mut [(&'a EntityKey, Cow<'a, Entity>)],
         block: BlockNumber,
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
@@ -711,7 +712,7 @@ impl Layout {
         &self,
         conn: &PgConnection,
         entity_type: &EntityType,
-        entity_ids: &[String],
+        entity_ids: &[&str],
         block: BlockNumber,
         stopwatch: &StopwatchMetrics,
     ) -> Result<usize, StoreError> {
@@ -890,7 +891,7 @@ impl ColumnType {
 
         // See if its an object type defined in the schema
         if let Some(id_type) = id_types.get(&EntityType::new(name.to_string())) {
-            return Ok(id_type.clone().into());
+            return Ok((*id_type).into());
         }
 
         // Check if it's an enum, and if it is, return an appropriate
@@ -1427,7 +1428,7 @@ impl LayoutCache {
             Some(CacheEntry { value, expires }) => {
                 if now <= expires {
                     // Entry is not expired; use it
-                    return Ok(value);
+                    Ok(value)
                 } else {
                     // Only do a cache refresh once; we don't want to have
                     // multiple threads refreshing the same layout
@@ -1448,11 +1449,11 @@ impl LayoutCache {
                             // Update the timestamp so we don't retry
                             // refreshing too often
                             self.cache(value.cheap_clone());
-                            return Ok(value);
+                            Ok(value)
                         }
                         Ok(layout) => {
                             self.cache(layout.cheap_clone());
-                            return Ok(layout);
+                            Ok(layout)
                         }
                     }
                 }
@@ -1460,7 +1461,7 @@ impl LayoutCache {
             None => {
                 let layout = Self::load(conn, site)?;
                 self.cache(layout.cheap_clone());
-                return Ok(layout);
+                Ok(layout)
             }
         }
     }

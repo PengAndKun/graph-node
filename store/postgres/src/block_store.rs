@@ -2,9 +2,9 @@ use std::{
     collections::{HashMap, HashSet},
     iter::FromIterator,
     sync::{Arc, RwLock},
+    time::Duration,
 };
 
-use graph::prelude::{tokio, StoreError};
 use graph::{
     components::store::BlockStore as BlockStoreTrait,
     prelude::{error, warn, BlockNumber, BlockPtr, EthereumNetworkIdentifier, Logger},
@@ -13,11 +13,15 @@ use graph::{
     constraint_violation,
     prelude::{anyhow, CheapClone},
 };
+use graph::{
+    prelude::{tokio, StoreError},
+    util::timed_cache::TimedCache,
+};
 
 use crate::{
-    chain_head_listener::ChainHeadUpdateSender, connection_pool::ConnectionPool, ChainStore,
+    chain_head_listener::ChainHeadUpdateSender, connection_pool::ConnectionPool,
+    primary::Mirror as PrimaryMirror, ChainStore, NotificationSender, Shard,
 };
-use crate::{subgraph_store::PRIMARY_SHARD, Shard};
 
 #[cfg(debug_assertions)]
 pub const FAKE_NETWORK_SHARED: &str = "fake_network_shared";
@@ -85,9 +89,8 @@ pub mod primary {
         }
     }
 
-    pub fn load_chains(pool: &ConnectionPool) -> Result<Vec<Chain>, StoreError> {
-        let conn = pool.get()?;
-        Ok(chains::table.load(&conn)?)
+    pub fn load_chains(conn: &PgConnection) -> Result<Vec<Chain>, StoreError> {
+        Ok(chains::table.load(conn)?)
     }
 
     pub fn find_chain(conn: &PgConnection, name: &str) -> Result<Option<Chain>, StoreError> {
@@ -173,7 +176,9 @@ pub struct BlockStore {
     /// previous state in the database.
     stores: RwLock<HashMap<String, Arc<ChainStore>>>,
     pools: HashMap<Shard, ConnectionPool>,
-    primary: ConnectionPool,
+    sender: Arc<NotificationSender>,
+    mirror: PrimaryMirror,
+    chain_head_cache: TimedCache<String, HashMap<String, BlockPtr>>,
 }
 
 impl BlockStore {
@@ -194,18 +199,23 @@ impl BlockStore {
         chains: Vec<(String, Vec<EthereumNetworkIdentifier>, Shard)>,
         // shard -> pool
         pools: HashMap<Shard, ConnectionPool>,
+        sender: Arc<NotificationSender>,
     ) -> Result<Self, StoreError> {
-        let primary = pools
-            .get(&PRIMARY_SHARD)
-            .expect("we always have a primary pool")
-            .clone();
-        let existing_chains = primary::load_chains(&primary)?;
+        // Cache chain head pointers for this long when returning
+        // information from `chain_head_pointers`
+        const CHAIN_HEAD_CACHE_TTL: Duration = Duration::from_secs(2);
+
+        let mirror = PrimaryMirror::new(&pools);
+        let existing_chains = mirror.read(|conn| primary::load_chains(conn))?;
+        let chain_head_cache = TimedCache::new(CHAIN_HEAD_CACHE_TTL);
 
         let block_store = Self {
             logger,
             stores: RwLock::new(HashMap::new()),
             pools,
-            primary,
+            sender,
+            mirror,
+            chain_head_cache,
         };
 
         fn reduce_idents(
@@ -264,11 +274,11 @@ impl BlockStore {
                     );
                         return false;
                     }
-                    return true;
+                    true
                 }
                 None => {
                     warn!(logger, "Failed to get net version and genesis hash from provider. Assuming it has not changed");
-                    return true;
+                    true
                 }
             }
         }
@@ -291,8 +301,12 @@ impl BlockStore {
                     block_store.add_chain_store(&chain, status, false)?;
                 }
                 (None, Some(ident)) => {
-                    let chain =
-                        primary::add_chain(&block_store.primary, &chain_name, &ident, &shard)?;
+                    let chain = primary::add_chain(
+                        &block_store.mirror.primary(),
+                        &chain_name,
+                        &ident,
+                        &shard,
+                    )?;
                     block_store.add_chain_store(&chain, ChainStatus::Ingestible, true)?;
                 }
                 (None, None) => {
@@ -324,7 +338,7 @@ impl BlockStore {
     }
 
     pub(crate) async fn query_permit_primary(&self) -> tokio::sync::OwnedSemaphorePermit {
-        self.primary.query_permit().await
+        self.mirror.primary().query_permit().await
     }
 
     fn add_chain_store(
@@ -338,7 +352,11 @@ impl BlockStore {
             .get(&chain.shard)
             .ok_or_else(|| constraint_violation!("there is no pool for shard {}", chain.shard))?
             .clone();
-        let sender = ChainHeadUpdateSender::new(self.primary.clone(), chain.name.clone());
+        let sender = ChainHeadUpdateSender::new(
+            self.mirror.primary().clone(),
+            chain.name.clone(),
+            self.sender.clone(),
+        );
         let ident = chain.network_identifier()?;
         let store = ChainStore::new(
             chain.name.clone(),
@@ -359,17 +377,30 @@ impl BlockStore {
         Ok(store)
     }
 
+    /// Return a map from network name to the network's chain head pointer.
+    /// The information is cached briefly since this method is used heavily
+    /// by the indexing status API
     pub fn chain_head_pointers(&self) -> Result<HashMap<String, BlockPtr>, StoreError> {
         let mut map = HashMap::new();
-        let stores = self
-            .stores
-            .read()
-            .unwrap()
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for store in stores {
-            map.extend(store.chain_head_pointers()?);
+        for (shard, pool) in &self.pools {
+            let cached = match self.chain_head_cache.get(shard.as_str()) {
+                Some(cached) => cached,
+                None => {
+                    let conn = match pool.get() {
+                        Ok(conn) => conn,
+                        Err(StoreError::DatabaseUnavailable) => continue,
+                        Err(e) => return Err(e),
+                    };
+                    let heads = Arc::new(ChainStore::chain_head_pointers(&conn)?);
+                    self.chain_head_cache.set(shard.to_string(), heads.clone());
+                    heads
+                }
+            };
+            map.extend(
+                cached
+                    .iter()
+                    .map(|(chain, ptr)| (chain.clone(), ptr.clone())),
+            );
         }
         Ok(map)
     }
@@ -381,13 +412,16 @@ impl BlockStore {
         store.chain_head_block(chain)
     }
 
-    fn lookup_chain(&self, chain: &str) -> Result<Option<Arc<ChainStore>>, StoreError> {
+    fn lookup_chain<'a>(&'a self, chain: &'a str) -> Result<Option<Arc<ChainStore>>, StoreError> {
         // See if we have that chain in the database even if it wasn't one
         // of the configured chains
-        let conn = self.primary.get()?;
-        primary::find_chain(&conn, chain)?
-            .map(|chain| self.add_chain_store(&chain, ChainStatus::ReadOnly, false))
-            .transpose()
+        self.mirror.read(|conn| {
+            primary::find_chain(&conn, chain).and_then(|chain| {
+                chain
+                    .map(|chain| self.add_chain_store(&chain, ChainStatus::ReadOnly, false))
+                    .transpose()
+            })
+        })
     }
 
     fn store(&self, chain: &str) -> Option<Arc<ChainStore>> {
@@ -417,7 +451,7 @@ impl BlockStore {
 
         // Delete from the primary first since that's where
         // deployment_schemas has a fk constraint on chains
-        primary::drop_chain(&self.primary, chain)?;
+        primary::drop_chain(&self.mirror.primary(), chain)?;
 
         chain_store.drop_chain()?;
 

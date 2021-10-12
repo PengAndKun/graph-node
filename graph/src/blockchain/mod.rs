@@ -4,8 +4,8 @@
 
 pub mod block_ingestor;
 pub mod block_stream;
+pub mod firehose_block_stream;
 pub mod polling_block_stream;
-
 mod types;
 
 // Try to reexport most of the necessary types
@@ -29,6 +29,7 @@ use crate::{
 use anyhow::{anyhow, Context, Error};
 use async_trait::async_trait;
 use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use slog::Logger;
 use slog::{self, SendSyncRefUnwindSafeKV};
 use std::{
@@ -41,12 +42,10 @@ use std::{
 };
 use web3::types::H256;
 
-pub use block_stream::{
-    BlockStream, BlockStreamMetrics, ChainHeadUpdateListener, ChainHeadUpdateStream,
-    TriggersAdapter,
-};
-pub use polling_block_stream::PollingBlockStream;
+pub use block_stream::{ChainHeadUpdateListener, ChainHeadUpdateStream, TriggersAdapter};
 pub use types::{BlockHash, BlockPtr};
+
+use self::block_stream::{BlockStream, BlockStreamMetrics};
 
 pub trait Block: Send + Sync {
     fn ptr(&self) -> BlockPtr;
@@ -310,16 +309,21 @@ pub trait NodeCapabilities<C: Blockchain> {
 }
 
 /// Blockchain technologies supported by Graph Node.
-#[derive(Copy, Clone, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum BlockchainKind {
     /// Ethereum itself or chains that are compatible.
     Ethereum,
+
+    /// NEAR chains (Mainnet, Testnet) or chains that are compatible
+    Near,
 }
 
 impl fmt::Display for BlockchainKind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let value = match self {
             BlockchainKind::Ethereum => "ethereum",
+            BlockchainKind::Near => "near",
         };
         write!(f, "{}", value)
     }
@@ -331,6 +335,7 @@ impl FromStr for BlockchainKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
             "ethereum" => Ok(BlockchainKind::Ethereum),
+            "near" => Ok(BlockchainKind::Near),
             _ => Err(anyhow!("unknown blockchain kind {}", s)),
         }
     }

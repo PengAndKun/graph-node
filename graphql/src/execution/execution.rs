@@ -294,11 +294,11 @@ pub fn execute_root_selection_set_uncached(
     // Split the top-level fields into introspection fields and
     // regular data fields
     let mut data_set = q::SelectionSet {
-        span: selection_set.span.clone(),
+        span: selection_set.span,
         items: Vec::new(),
     };
     let mut intro_set = q::SelectionSet {
-        span: selection_set.span.clone(),
+        span: selection_set.span,
         items: Vec::new(),
     };
     let mut meta_items = Vec::new();
@@ -918,9 +918,7 @@ fn complete_value(
         }
 
         // If the resolved value is null, return null
-        _ if resolved_value == q::Value::Null => {
-            return Ok(resolved_value);
-        }
+        _ if resolved_value == q::Value::Null => Ok(resolved_value),
 
         // Complete list values
         s::Type::ListType(inner_type) => {
@@ -962,7 +960,7 @@ fn complete_value(
                 s::TypeDefinition::Scalar(scalar_type) => {
                     resolved_value.coerce(scalar_type).map_err(|value| {
                         vec![QueryExecutionError::ScalarCoercionError(
-                            field.position.clone(),
+                            field.position,
                             field.name.to_owned(),
                             value,
                             scalar_type.name.to_owned(),
@@ -974,7 +972,7 @@ fn complete_value(
                 s::TypeDefinition::Enum(enum_type) => {
                     resolved_value.coerce(enum_type).map_err(|value| {
                         vec![QueryExecutionError::EnumCoercionError(
-                            field.position.clone(),
+                            field.position,
                             field.name.to_owned(),
                             value,
                             enum_type.name.to_owned(),
