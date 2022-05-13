@@ -1,12 +1,13 @@
-use graph::components::near::NearBlockExt;
+use graph::blockchain::{Block, TriggerWithHandler};
 use graph::components::store::StoredDynamicDataSource;
-use graph::data::subgraph::{DataSourceContext, Source};
+use graph::data::subgraph::DataSourceContext;
+use graph::prelude::SubgraphManifestValidationError;
 use graph::{
-    anyhow,
+    anyhow::{anyhow, Error},
     blockchain::{self, Blockchain},
     prelude::{
-        async_trait, info, BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize, Error,
-        Link, LinkResolver, Logger,
+        async_trait, info, BlockNumber, CheapClone, DataSourceTemplateInfo, Deserialize, Link,
+        LinkResolver, Logger,
     },
     semver,
 };
@@ -14,17 +15,17 @@ use std::collections::BTreeMap;
 use std::{convert::TryFrom, sync::Arc};
 
 use crate::chain::Chain;
-use crate::trigger::{NearBlockTriggerType, NearTrigger};
-use crate::MappingTrigger;
+use crate::trigger::NearTrigger;
+
+pub const NEAR_KIND: &str = "near";
+
 /// Runtime representation of a data source.
-// Note: Not great for memory usage that this needs to be `Clone`, considering how there may be tens
-// of thousands of data sources in memory at once.
 #[derive(Clone, Debug)]
 pub struct DataSource {
     pub kind: String,
     pub network: Option<String>,
     pub name: String,
-    pub source: Source,
+    pub(crate) source: Source,
     pub mapping: Mapping,
     pub context: Arc<Option<DataSourceContext>>,
     pub creation_block: Option<BlockNumber>,
@@ -32,7 +33,7 @@ pub struct DataSource {
 
 impl blockchain::DataSource<Chain> for DataSource {
     fn address(&self) -> Option<&[u8]> {
-        self.source.address.as_ref().map(|x| x.as_bytes())
+        self.source.account.as_ref().map(String::as_bytes)
     }
 
     fn start_block(&self) -> BlockNumber {
@@ -42,23 +43,38 @@ impl blockchain::DataSource<Chain> for DataSource {
     fn match_and_decode(
         &self,
         trigger: &<Chain as Blockchain>::TriggerData,
-        block: Arc<<Chain as Blockchain>::Block>,
+        block: &Arc<<Chain as Blockchain>::Block>,
         _logger: &Logger,
-    ) -> Result<Option<<Chain as Blockchain>::MappingTrigger>, Error> {
+    ) -> Result<Option<TriggerWithHandler<Chain>>, Error> {
         if self.source.start_block > block.number() {
             return Ok(None);
         }
 
-        match trigger {
-            NearTrigger::Block(_, trigger_type) => {
-                let handler = match self.handler_for_block(&trigger_type) {
-                    Some(handler) => handler,
-                    None => return Ok(None),
-                };
+        let handler = match trigger {
+            // A block trigger matches if a block handler is present.
+            NearTrigger::Block(_) => match self.handler_for_block() {
+                Some(handler) => &handler.handler,
+                None => return Ok(None),
+            },
 
-                Ok(Some(MappingTrigger::Block { block, handler }))
+            // A receipt trigger matches if the receiver matches `source.account` and a receipt
+            // handler is present.
+            NearTrigger::Receipt(receipt) => {
+                if Some(&receipt.receipt.receiver_id) != self.source.account.as_ref() {
+                    return Ok(None);
+                }
+
+                match self.handler_for_receipt() {
+                    Some(handler) => &handler.handler,
+                    None => return Ok(None),
+                }
             }
-        }
+        };
+
+        Ok(Some(TriggerWithHandler::new(
+            trigger.cheap_clone(),
+            handler.to_owned(),
+        )))
     }
 
     fn name(&self) -> &str {
@@ -119,9 +135,33 @@ impl blockchain::DataSource<Chain> for DataSource {
         todo!()
     }
 
-    fn validate(&self) -> Vec<graph::prelude::SubgraphManifestValidationError> {
-        // FIXME (NEAR): Implement me correctly
-        vec![]
+    fn validate(&self) -> Vec<Error> {
+        let mut errors = Vec::new();
+
+        if self.kind != NEAR_KIND {
+            errors.push(anyhow!(
+                "data source has invalid `kind`, expected {} but found {}",
+                NEAR_KIND,
+                self.kind
+            ))
+        }
+
+        // Validate that there is a `source` address if there are receipt handlers
+        let no_source_address = self.address().is_none();
+        let has_receipt_handlers = !self.mapping.receipt_handlers.is_empty();
+        if no_source_address && has_receipt_handlers {
+            errors.push(SubgraphManifestValidationError::SourceAddressRequired.into());
+        };
+
+        // Validate that there are no more than one of both block handlers and receipt handlers
+        if self.mapping.block_handlers.len() > 1 {
+            errors.push(anyhow!("data source has duplicated block handlers"));
+        }
+        if self.mapping.receipt_handlers.len() > 1 {
+            errors.push(anyhow!("data source has duplicated receipt handlers"));
+        }
+
+        errors
     }
 
     fn api_version(&self) -> semver::Version {
@@ -156,16 +196,12 @@ impl DataSource {
         })
     }
 
-    fn handler_for_block(
-        &self,
-        trigger_type: &NearBlockTriggerType,
-    ) -> Option<MappingBlockHandler> {
-        match trigger_type {
-            NearBlockTriggerType::Every => {
-                // FIXME (NEAR): We need to decide how to deal with multi block handlers, allow only 1?
-                self.mapping.block_handlers.first().map(|v| v.clone())
-            }
-        }
+    fn handler_for_block(&self) -> Option<&MappingBlockHandler> {
+        self.mapping.block_handlers.first()
+    }
+
+    fn handler_for_receipt(&self) -> Option<&ReceiptHandler> {
+        self.mapping.receipt_handlers.first()
     }
 }
 
@@ -174,7 +210,7 @@ pub struct UnresolvedDataSource {
     pub kind: String,
     pub network: Option<String>,
     pub name: String,
-    pub source: Source,
+    pub(crate) source: Source,
     pub mapping: UnresolvedMapping,
     pub context: Option<DataSourceContext>,
 }
@@ -183,9 +219,9 @@ pub struct UnresolvedDataSource {
 impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
     async fn resolve(
         self,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
-    ) -> Result<DataSource, anyhow::Error> {
+    ) -> Result<DataSource, Error> {
         let UnresolvedDataSource {
             kind,
             network,
@@ -195,39 +231,50 @@ impl blockchain::UnresolvedDataSource<Chain> for UnresolvedDataSource {
             context,
         } = self;
 
-        info!(logger, "Resolve data source"; "name" => &name, "source" => &source.start_block);
+        info!(logger, "Resolve data source"; "name" => &name, "source_account" => format_args!("{:?}", source.account), "source_start_block" => source.start_block);
 
-        let mapping = mapping.resolve(&*resolver, logger).await?;
+        let mapping = mapping.resolve(resolver, logger).await?;
 
         DataSource::from_manifest(kind, network, name, source, mapping, context)
     }
 }
 
 impl TryFrom<DataSourceTemplateInfo<Chain>> for DataSource {
-    type Error = anyhow::Error;
+    type Error = Error;
 
-    fn try_from(info: DataSourceTemplateInfo<Chain>) -> Result<Self, anyhow::Error> {
-        let DataSourceTemplateInfo {
-            template,
-            params: _,
-            context,
-            creation_block,
-        } = info;
+    fn try_from(_info: DataSourceTemplateInfo<Chain>) -> Result<Self, Error> {
+        Err(anyhow!("Near subgraphs do not support templates"))
 
-        Ok(DataSource {
-            kind: template.kind,
-            network: template.network,
-            name: template.name,
-            source: Source {
-                // FIXME (NEAR): Made those element dummy elements
-                address: None,
-                abi: "".to_string(),
-                start_block: 0,
-            },
-            mapping: template.mapping,
-            context: Arc::new(context),
-            creation_block: Some(creation_block),
-        })
+        // How this might be implemented if/when Near gets support for templates:
+        // let DataSourceTemplateInfo {
+        //     template,
+        //     params,
+        //     context,
+        //     creation_block,
+        // } = info;
+
+        // let account = params
+        //     .get(0)
+        //     .with_context(|| {
+        //         format!(
+        //             "Failed to create data source from template `{}`: account parameter is missing",
+        //             template.name
+        //         )
+        //     })?
+        //     .clone();
+
+        // Ok(DataSource {
+        //     kind: template.kind,
+        //     network: template.network,
+        //     name: template.name,
+        //     source: Source {
+        //         account,
+        //         start_block: 0,
+        //     },
+        //     mapping: template.mapping,
+        //     context: Arc::new(context),
+        //     creation_block: Some(creation_block),
+        // })
     }
 }
 
@@ -246,9 +293,9 @@ pub type DataSourceTemplate = BaseDataSourceTemplate<Mapping>;
 impl blockchain::UnresolvedDataSourceTemplate<Chain> for UnresolvedDataSourceTemplate {
     async fn resolve(
         self,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
-    ) -> Result<DataSourceTemplate, anyhow::Error> {
+    ) -> Result<DataSourceTemplate, Error> {
         let UnresolvedDataSourceTemplate {
             kind,
             network,
@@ -284,52 +331,42 @@ impl blockchain::DataSourceTemplate<Chain> for DataSourceTemplate {
 #[derive(Clone, Debug, Default, Hash, Eq, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UnresolvedMapping {
-    pub kind: String,
     pub api_version: String,
     pub language: String,
     pub entities: Vec<String>,
     #[serde(default)]
     pub block_handlers: Vec<MappingBlockHandler>,
+    #[serde(default)]
+    pub receipt_handlers: Vec<ReceiptHandler>,
     pub file: Link,
 }
 
 impl UnresolvedMapping {
     pub async fn resolve(
         self,
-        resolver: &impl LinkResolver,
+        resolver: &Arc<dyn LinkResolver>,
         logger: &Logger,
-    ) -> Result<Mapping, anyhow::Error> {
+    ) -> Result<Mapping, Error> {
         let UnresolvedMapping {
-            kind,
             api_version,
             language,
             entities,
             block_handlers,
+            receipt_handlers,
             file: link,
         } = self;
 
         let api_version = semver::Version::parse(&api_version)?;
 
-        // FIXME (NEAR): MAX_API_VERSION is mostly tied to Ethereum, we would need a min/max version per
-        //               blockchain.
-        // ensure!(
-        //     semver::VersionReq::parse(&format!("<= {}", *MAX_API_VERSION))
-        //         .unwrap()
-        //         .matches(&api_version),
-        //     "The maximum supported mapping API version of this indexer is {}, but `{}` was found",
-        //     *MAX_API_VERSION,
-        //     api_version
-        // );
-
         info!(logger, "Resolve mapping"; "link" => &link.link);
         let module_bytes = resolver.cat(logger, &link).await?;
 
         Ok(Mapping {
-            kind,
             api_version,
             language,
             entities,
-            block_handlers: block_handlers.clone(),
+            block_handlers,
+            receipt_handlers,
             runtime: Arc::new(module_bytes),
             link,
         })
@@ -338,11 +375,11 @@ impl UnresolvedMapping {
 
 #[derive(Clone, Debug)]
 pub struct Mapping {
-    pub kind: String,
     pub api_version: semver::Version,
     pub language: String,
     pub entities: Vec<String>,
     pub block_handlers: Vec<MappingBlockHandler>,
+    pub receipt_handlers: Vec<ReceiptHandler>,
     pub runtime: Arc<Vec<u8>>,
     pub link: Link,
 }
@@ -350,4 +387,17 @@ pub struct Mapping {
 #[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
 pub struct MappingBlockHandler {
     pub handler: String,
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+pub struct ReceiptHandler {
+    handler: String,
+}
+
+#[derive(Clone, Debug, Hash, Eq, PartialEq, Deserialize)]
+pub(crate) struct Source {
+    // A data source that does not have an account can only have block handlers.
+    pub(crate) account: Option<String>,
+    #[serde(rename = "startBlock", default)]
+    pub(crate) start_block: BlockNumber,
 }

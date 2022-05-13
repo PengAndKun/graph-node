@@ -60,7 +60,11 @@ fn to_source(
     })
 }
 
-pub fn load(conn: &PgConnection, id: &str) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
+pub fn load(
+    conn: &PgConnection,
+    id: &str,
+    block: BlockNumber,
+) -> Result<Vec<StoredDynamicDataSource>, StoreError> {
     use dynamic_ethereum_contract_data_source as decds;
 
     // Query to load the data sources. Ordering by the creation block and `vid` makes sure they are
@@ -77,6 +81,7 @@ pub fn load(conn: &PgConnection, id: &str) -> Result<Vec<StoredDynamicDataSource
             decds::start_block,
             decds::ethereum_block_number,
         ))
+        .filter(decds::ethereum_block_number.le(sql(&format!("{}::numeric", block))))
         .order_by((decds::ethereum_block_number, decds::vid))
         .load::<(
             i64,
@@ -99,7 +104,7 @@ pub fn load(conn: &PgConnection, id: &str) -> Result<Vec<StoredDynamicDataSource
             creation_block,
         };
 
-        if !(data_sources.last().and_then(|d| d.creation_block) <= data_source.creation_block) {
+        if data_sources.last().and_then(|d| d.creation_block) > data_source.creation_block {
             return Err(StoreError::ConstraintViolation(
                 "data sources not ordered by creation block".to_string(),
             ));

@@ -1,16 +1,21 @@
 use graph::{
-    blockchain::{block_ingestor::CLEANUP_BLOCKS, BlockchainKind},
+    anyhow::Error,
+    blockchain::BlockchainKind,
     prelude::{
         anyhow::{anyhow, bail, Context, Result},
-        info, serde_json, Logger, NodeId,
+        info,
+        serde::{
+            de::{self, value, SeqAccess, Visitor},
+            Deserialize, Deserializer, Serialize,
+        },
+        serde_json, Logger, NodeId, StoreError,
     },
 };
-use graph_chain_ethereum::NodeCapabilities;
+use graph_chain_ethereum::{self as ethereum, NodeCapabilities};
 use graph_store_postgres::{DeploymentPlacer, Shard as ShardName, PRIMARY_SHARD};
 
 use http::{HeaderMap, Uri};
 use regex::Regex;
-use serde::{Deserialize, Serialize};
 use std::fs::read_to_string;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -36,6 +41,7 @@ pub struct Opt {
     pub ethereum_rpc: Vec<String>,
     pub ethereum_ws: Vec<String>,
     pub ethereum_ipc: Vec<String>,
+    pub unsafe_config: bool,
 }
 
 impl Default for Opt {
@@ -51,6 +57,7 @@ impl Default for Opt {
             ethereum_rpc: vec![],
             ethereum_ws: vec![],
             ethereum_ipc: vec![],
+            unsafe_config: false,
         }
     }
 }
@@ -94,7 +101,7 @@ impl Config {
         if !self.stores.contains_key(PRIMARY_SHARD.as_str()) {
             return Err(anyhow!("missing a primary store"));
         }
-        if self.stores.len() > 1 && *CLEANUP_BLOCKS {
+        if self.stores.len() > 1 && ethereum::ENV_VARS.cleanup_blocks {
             // See 8b6ad0c64e244023ac20ced7897fe666
             return Err(anyhow!(
                 "GRAPH_ETHEREUM_CLEANUP_BLOCKS can not be used with a sharded store"
@@ -107,12 +114,10 @@ impl Config {
 
         // Check that deployment rules only reference existing stores and chains
         for (i, rule) in self.deployment.rules.iter().enumerate() {
-            if !self.stores.contains_key(&rule.shard) {
-                return Err(anyhow!(
-                    "unknown shard {} in deployment rule {}",
-                    rule.shard,
-                    i
-                ));
+            for shard in &rule.shards {
+                if !self.stores.contains_key(shard) {
+                    return Err(anyhow!("unknown shard {} in deployment rule {}", shard, i));
+                }
             }
             if let Some(networks) = &rule.pred.network {
                 for network in networks.to_vec() {
@@ -161,7 +166,7 @@ impl Config {
         let deployment = Deployment::from_opt(opt);
         let mut stores = BTreeMap::new();
         let chains = ChainSection::from_opt(opt)?;
-        stores.insert(PRIMARY_SHARD.to_string(), Shard::from_opt(opt)?);
+        stores.insert(PRIMARY_SHARD.to_string(), Shard::from_opt(true, opt)?);
         Ok(Config {
             general: None,
             stores,
@@ -226,10 +231,11 @@ impl Shard {
             return Err(anyhow!("missing pool size definition for shard `{}`", name));
         }
 
-        self.pool_size.validate(&self.connection)?;
+        self.pool_size
+            .validate(name == PRIMARY_SHARD.as_str(), &self.connection)?;
         for (name, replica) in self.replicas.iter_mut() {
             validate_name(name).context("illegal replica name")?;
-            replica.validate(&self.pool_size)?;
+            replica.validate(name == PRIMARY_SHARD.as_str(), &self.pool_size)?;
         }
 
         let no_weight =
@@ -244,13 +250,13 @@ impl Shard {
         Ok(())
     }
 
-    fn from_opt(opt: &Opt) -> Result<Self> {
+    fn from_opt(is_primary: bool, opt: &Opt) -> Result<Self> {
         let postgres_url = opt
             .postgres_url
             .as_ref()
             .expect("validation checked that postgres_url is set");
         let pool_size = PoolSize::Fixed(opt.store_connection_pool_size);
-        pool_size.validate(&postgres_url)?;
+        pool_size.validate(is_primary, &postgres_url)?;
         let mut replicas = BTreeMap::new();
         for (i, host) in opt.postgres_secondary_hosts.iter().enumerate() {
             let replica = Replica {
@@ -289,7 +295,7 @@ impl PoolSize {
         Self::Fixed(5)
     }
 
-    fn validate(&self, connection: &str) -> Result<()> {
+    fn validate(&self, is_primary: bool, connection: &str) -> Result<()> {
         use PoolSize::*;
 
         let pool_size = match self {
@@ -298,14 +304,17 @@ impl PoolSize {
             Rule(rules) => rules.iter().map(|rule| rule.size).min().unwrap_or(0u32),
         };
 
-        if pool_size < 2 {
-            Err(anyhow!(
+        match pool_size {
+            0 if is_primary => Err(anyhow!(
+                "the pool size for the primary shard must be at least 2"
+            )),
+            0 => Ok(()),
+            1 => Err(anyhow!(
                 "connection pool size must be at least 2, but is {} for {}",
                 pool_size,
                 connection
-            ))
-        } else {
-            Ok(())
+            )),
+            _ => Ok(()),
         }
     }
 
@@ -320,7 +329,7 @@ impl PoolSize {
                 .map(|rule| rule.size)
                 .ok_or_else(|| {
                     anyhow!(
-                        "no rule matches `{}` for the pool of shard {}",
+                        "no rule matches node id `{}` for the pool of shard {}",
                         node.as_str(),
                         name
                     )
@@ -355,13 +364,13 @@ pub struct Replica {
 }
 
 impl Replica {
-    fn validate(&mut self, pool_size: &PoolSize) -> Result<()> {
+    fn validate(&mut self, is_primary: bool, pool_size: &PoolSize) -> Result<()> {
         self.connection = shellexpand::env(&self.connection)?.into_owned();
         if matches!(self.pool_size, PoolSize::None) {
             self.pool_size = pool_size.clone();
         }
 
-        self.pool_size.validate(&self.connection)?;
+        self.pool_size.validate(is_primary, &self.connection)?;
         Ok(())
     }
 }
@@ -524,10 +533,20 @@ pub enum ProviderDetails {
     Web3(Web3Provider),
 }
 
+const FIREHOSE_FILTER_FEATURE: &str = "filters";
+const FIREHOSE_PROVIDER_FEATURES: [&str; 1] = [FIREHOSE_FILTER_FEATURE];
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct FirehoseProvider {
     pub url: String,
     pub token: Option<String>,
+    #[serde(default)]
+    pub features: BTreeSet<String>,
+}
+
+impl FirehoseProvider {
+    pub fn filters_enabled(&self) -> bool {
+        self.features.contains(FIREHOSE_FILTER_FEATURE)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -563,17 +582,35 @@ impl Provider {
         validate_name(&self.label).context("illegal provider name")?;
 
         match self.details {
-            ProviderDetails::Firehose(ref firehose) => {
+            ProviderDetails::Firehose(ref mut firehose) => {
+                firehose.url = shellexpand::env(&firehose.url)?.into_owned();
+
                 // A Firehose url must be a valid Uri since gRPC library we use (Tonic)
                 // works with Uri.
+                let label = &self.label;
                 firehose.url.parse::<Uri>().map_err(|e| {
                     anyhow!(
                         "the url `{}` for firehose provider {} is not a legal URI: {}",
                         firehose.url,
-                        self.label,
+                        label,
                         e
                     )
                 })?;
+
+                if let Some(token) = &firehose.token {
+                    firehose.token = Some(shellexpand::env(token)?.into_owned());
+                }
+
+                if firehose
+                    .features
+                    .iter()
+                    .any(|feature| !FIREHOSE_PROVIDER_FEATURES.contains(&feature.as_str()))
+                {
+                    return Err(anyhow!(
+                        "supported firehose endpoint filters are: {:?}",
+                        FIREHOSE_PROVIDER_FEATURES
+                    ));
+                }
             }
 
             ProviderDetails::Web3(ref mut web3) => {
@@ -789,14 +826,18 @@ impl Deployment {
 }
 
 impl DeploymentPlacer for Deployment {
-    fn place(&self, name: &str, network: &str) -> Result<Option<(ShardName, Vec<NodeId>)>, String> {
+    fn place(
+        &self,
+        name: &str,
+        network: &str,
+    ) -> Result<Option<(Vec<ShardName>, Vec<NodeId>)>, String> {
         // Errors here are really programming errors. We should have validated
         // everything already so that the various conversions can't fail. We
         // still return errors so that they bubble up to the deployment request
         // rather than crashing the node and burying the crash in the logs
         let placement = match self.rules.iter().find(|rule| rule.matches(name, network)) {
             Some(rule) => {
-                let shard = ShardName::new(rule.shard.clone()).map_err(|e| e.to_string())?;
+                let shards = rule.shard_names().map_err(|e| e.to_string())?;
                 let indexers: Vec<_> = rule
                     .indexers
                     .iter()
@@ -805,7 +846,7 @@ impl DeploymentPlacer for Deployment {
                             .map_err(|()| format!("{} is not a valid node name", idx))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
-                Some((shard, indexers))
+                Some((shards, indexers))
             }
             None => None,
         };
@@ -817,8 +858,13 @@ impl DeploymentPlacer for Deployment {
 struct Rule {
     #[serde(rename = "match", default)]
     pred: Predicate,
-    #[serde(default = "primary_store")]
-    shard: String,
+    // For backwards compatibility, we also accept 'shard' for the shards
+    #[serde(
+        alias = "shard",
+        default = "primary_store",
+        deserialize_with = "string_or_vec"
+    )]
+    shards: Vec<String>,
     indexers: Vec<String>,
 }
 
@@ -831,6 +877,14 @@ impl Rule {
         self.pred.matches(name, network)
     }
 
+    fn shard_names(&self) -> Result<Vec<ShardName>, StoreError> {
+        self.shards
+            .iter()
+            .cloned()
+            .map(ShardName::new)
+            .collect::<Result<_, _>>()
+    }
+
     fn validate(&self) -> Result<()> {
         if self.indexers.is_empty() {
             return Err(anyhow!("useless rule without indexers"));
@@ -838,8 +892,7 @@ impl Rule {
         for indexer in &self.indexers {
             NodeId::new(indexer).map_err(|()| anyhow!("invalid node id {}", &indexer))?;
         }
-        ShardName::new(self.shard.clone())
-            .map_err(|e| anyhow!("illegal name for store shard `{}`: {}", &self.shard, e))?;
+        self.shard_names().map_err(Error::from)?;
         Ok(())
     }
 }
@@ -930,12 +983,44 @@ fn no_name() -> Regex {
     Regex::new(NO_NAME).unwrap()
 }
 
-fn primary_store() -> String {
-    PRIMARY_SHARD.to_string()
+fn primary_store() -> Vec<String> {
+    vec![PRIMARY_SHARD.to_string()]
 }
 
 fn one() -> usize {
     1
+}
+
+// From https://github.com/serde-rs/serde/issues/889#issuecomment-295988865
+fn string_or_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct StringOrVec;
+
+    impl<'de> Visitor<'de> for StringOrVec {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("string or list of strings")
+        }
+
+        fn visit_str<E>(self, s: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![s.to_owned()])
+        }
+
+        fn visit_seq<S>(self, seq: S) -> Result<Self::Value, S::Error>
+        where
+            S: SeqAccess<'de>,
+        {
+            Deserialize::deserialize(value::SeqAccessDeserializer::new(seq))
+        }
+    }
+
+    deserializer.deserialize_any(StringOrVec)
 }
 
 #[cfg(test)]
@@ -1165,6 +1250,29 @@ mod tests {
         let actual = toml::from_str(
             r#"
                 label = "firehose"
+                details = { type = "firehose", url = "http://localhost:9000", features = [] }
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            Provider {
+                label: "firehose".to_owned(),
+                details: ProviderDetails::Firehose(FirehoseProvider {
+                    url: "http://localhost:9000".to_owned(),
+                    token: None,
+                    features: BTreeSet::new(),
+                }),
+            },
+            actual
+        );
+    }
+
+    #[test]
+    fn it_works_on_new_firehose_provider_from_toml_no_features() {
+        let actual = toml::from_str(
+            r#"
+                label = "firehose"
                 details = { type = "firehose", url = "http://localhost:9000" }
             "#,
         )
@@ -1176,10 +1284,31 @@ mod tests {
                 details: ProviderDetails::Firehose(FirehoseProvider {
                     url: "http://localhost:9000".to_owned(),
                     token: None,
+                    features: BTreeSet::new(),
                 }),
             },
             actual
         );
+    }
+
+    #[test]
+    fn it_works_on_new_firehose_provider_from_toml_unsupported_features() {
+        let actual = toml::from_str::<Provider>(
+            r#"
+                label = "firehose"
+                details = { type = "firehose", url = "http://localhost:9000", features = ["bananas"]}
+            "#,
+        ).unwrap().validate();
+        assert_eq!(true, actual.is_err(), "{:?}", actual);
+
+        if let Err(error) = actual {
+            assert_eq!(
+                true,
+                error
+                    .to_string()
+                    .starts_with("supported firehose endpoint filters are:")
+            )
+        }
     }
 
     fn read_resource_as_string<P: AsRef<Path>>(path: P) -> String {

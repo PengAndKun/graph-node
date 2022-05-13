@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use graph::data::value::Word;
 use web3::types::H256;
 
 use crate::deployment_store::{DeploymentStore, ReplicaId};
@@ -36,7 +37,7 @@ impl QueryStoreTrait for QueryStore {
     fn find_query_values(
         &self,
         query: EntityQuery,
-    ) -> Result<Vec<BTreeMap<String, q::Value>>, QueryExecutionError> {
+    ) -> Result<Vec<BTreeMap<Word, r::Value>>, QueryExecutionError> {
         assert_eq!(&self.site.deployment, &query.subgraph_id);
         let conn = self
             .store
@@ -54,8 +55,8 @@ impl QueryStoreTrait for QueryStore {
             .await?)
     }
 
-    fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError> {
-        self.store.block_ptr(&self.site)
+    async fn block_ptr(&self) -> Result<Option<BlockPtr>, StoreError> {
+        self.store.block_ptr(self.site.cheap_clone()).await
     }
 
     fn block_number(&self, block_hash: H256) -> Result<Option<BlockNumber>, StoreError> {
@@ -69,9 +70,8 @@ impl QueryStoreTrait for QueryStore {
         self.chain_store
             .block_number(block_hash)?
             .map(|(network_name, number)| {
-                if &network_name == subgraph_network {
-                    BlockNumber::try_from(number)
-                        .map_err(|e| StoreError::QueryExecutionError(e.to_string()))
+                if network_name == subgraph_network {
+                    Ok(number)
                 } else {
                     Err(StoreError::QueryExecutionError(format!(
                         "subgraph {} belongs to network {} but block {:x} belongs to network {}",
@@ -82,7 +82,7 @@ impl QueryStoreTrait for QueryStore {
             .transpose()
     }
 
-    fn wait_stats(&self) -> PoolWaitStats {
+    fn wait_stats(&self) -> Result<PoolWaitStats, StoreError> {
         self.store.wait_stats(self.replica_id)
     }
 
@@ -111,7 +111,7 @@ impl QueryStoreTrait for QueryStore {
         &self.site.network
     }
 
-    async fn query_permit(&self) -> tokio::sync::OwnedSemaphorePermit {
+    async fn query_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, StoreError> {
         self.store.query_permit(self.replica_id).await
     }
 }

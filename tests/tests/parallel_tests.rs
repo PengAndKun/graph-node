@@ -5,7 +5,7 @@ use common::helpers::{
     basename, get_unique_ganache_counter, get_unique_postgres_counter, make_ganache_uri,
     make_ipfs_uri, make_postgres_uri, pretty_output, GraphNodePorts, MappedPorts,
 };
-use futures::StreamExt;
+use futures03::StreamExt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -65,7 +65,7 @@ impl IntegrationTestSetup {
 #[derive(Debug)]
 struct TestCommandResults {
     success: bool,
-    exit_code: Option<i32>,
+    _exit_code: Option<i32>,
     stdout: String,
     stderr: String,
 }
@@ -341,7 +341,7 @@ async fn run_test_command(test_setup: &IntegrationTestSetup) -> anyhow::Result<T
 
     Ok(TestCommandResults {
         success: output.status.success(),
-        exit_code: output.status.code(),
+        _exit_code: output.status.code(),
         stdout: pretty_output(&output.stdout, &stdout_tag),
         stderr: pretty_output(&output.stderr, &stderr_tag),
     })
